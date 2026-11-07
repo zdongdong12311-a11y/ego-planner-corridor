@@ -1,0 +1,388 @@
+diff --git a/src/planner/plan_env/include/plan_env/grid_map.h b/src/planner/plan_env/include/plan_env/grid_map.h
+index 560dcd7..33355e6 100644
+--- a/src/planner/plan_env/include/plan_env/grid_map.h
++++ b/src/planner/plan_env/include/plan_env/grid_map.h
+@@ -80,6 +80,18 @@ struct MappingParameters {
+ 
+   /* active mapping */
+   double unknown_flag_;
++
++  /* ---------- virtual height limit (virtual floor & ceiling) ---------- */
++  bool height_limit_enable_;      // master switch of the height corridor module
++  double height_floor_offset_;    // floor height relative to ground_height_ ("min_height" param)
++  double height_ceil_offset_;     // ceiling height relative to ground_height_ ("max_height" param)
++  double virtual_floor_height_;   // absolute z of the virtual floor (ground_height_ + height_floor_offset_)
++  double virtual_ceil_z_;         // absolute z of the virtual ceiling (min of all enabled ceiling sources)
++  bool floor_active_, ceil_active_;
++  bool start_relax_;              // relax the boundaries when the drone starts outside the corridor (e.g. takeoff from ground)
++  double start_relax_clearance_;  // clearance used by the start relaxation rule
++  bool cloud_filter_enable_;      // filter out real ground/ceiling points before marking occupancy
++  double cloud_filter_z_min_, cloud_filter_z_max_; // precomputed nominal filter bounds
+ };
+ 
+ // intermediate mapping data for fusion
+@@ -196,6 +208,10 @@ private:
+   void updateOccupancyCallback(const ros::TimerEvent& /*event*/);
+   void visCallback(const ros::TimerEvent& /*event*/);
+ 
++  // virtual height limit (virtual floor & ceiling)
++  void computeEffectiveHeightLimits(double& floor_z, bool& floor_valid, double& ceil_z, bool& ceil_valid);
++  void stampVirtualBoundaries();
++
+   // main update process
+   void projectDepthImage();
+   void raycastProcess();
+diff --git a/src/planner/plan_env/src/grid_map.cpp b/src/planner/plan_env/src/grid_map.cpp
+index c88cbef..f9a3b53 100644
+--- a/src/planner/plan_env/src/grid_map.cpp
++++ b/src/planner/plan_env/src/grid_map.cpp
+@@ -49,6 +49,42 @@ void GridMap::initMap(ros::NodeHandle &nh)
+   node_.param("grid_map/local_map_margin", mp_.local_map_margin_, 1);
+   node_.param("grid_map/ground_height", mp_.ground_height_, 1.0);
+ 
++  /* ---------- virtual height limit (virtual floor & ceiling) ---------- */
++  node_.param("grid_map/height_limit/enable", mp_.height_limit_enable_, false);
++  node_.param("grid_map/height_limit/min_height", mp_.height_floor_offset_, -1.0);
++  node_.param("grid_map/height_limit/max_height", mp_.height_ceil_offset_, -1.0);
++  node_.param("grid_map/height_limit/start_relax", mp_.start_relax_, true);
++  node_.param("grid_map/height_limit/start_relax_clearance", mp_.start_relax_clearance_, 0.2);
++  node_.param("grid_map/height_limit/cloud_filter", mp_.cloud_filter_enable_, true);
++
++  // virtual floor: ground_height_ + min_height (only when the module is enabled)
++  mp_.virtual_floor_height_ = mp_.ground_height_ + mp_.height_floor_offset_;
++  mp_.floor_active_ = mp_.height_limit_enable_ && (mp_.height_floor_offset_ > -0.5);
++
++  // virtual ceiling: the lower (more conservative) of the legacy "virtual_ceil_height"
++  // and the new "ground_height_ + max_height" wins if both are enabled
++  bool has_legacy_ceil = mp_.virtual_ceil_height_ > -0.5;
++  bool has_offset_ceil = mp_.height_limit_enable_ && (mp_.height_ceil_offset_ > -0.5);
++  if (has_legacy_ceil && has_offset_ceil)
++    mp_.virtual_ceil_z_ = std::min(mp_.virtual_ceil_height_, mp_.ground_height_ + mp_.height_ceil_offset_);
++  else if (has_offset_ceil)
++    mp_.virtual_ceil_z_ = mp_.ground_height_ + mp_.height_ceil_offset_;
++  else if (has_legacy_ceil)
++    mp_.virtual_ceil_z_ = mp_.virtual_ceil_height_;
++  mp_.ceil_active_ = has_legacy_ceil || has_offset_ceil;
++
++  // precomputed bounds for pre-filtering raw points (nominal limits, no start relax)
++  // points below the map origin are discarded by isInMap() anyway, so using the map
++  // bottom as z_min also saves computation when the floor is disabled
++  mp_.cloud_filter_z_min_ = mp_.floor_active_ ? mp_.virtual_floor_height_ : (mp_.ground_height_ + 1e-3);
++  mp_.cloud_filter_z_max_ = mp_.ceil_active_ ? mp_.virtual_ceil_z_ : 1e9;
++
++  cout << "[height_limit] enable=" << mp_.height_limit_enable_
++       << ", floor=" << (mp_.floor_active_ ? to_string(mp_.virtual_floor_height_) : string("off"))
++       << ", ceiling=" << (mp_.ceil_active_ ? to_string(mp_.virtual_ceil_z_) : string("off"))
++       << ", start_relax=" << mp_.start_relax_
++       << ", cloud_filter=" << mp_.cloud_filter_enable_ << endl;
++
+   mp_.resolution_inv_ = 1 / mp_.resolution_;
+   mp_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, mp_.ground_height_);
+   mp_.map_size_ = Eigen::Vector3d(x_size, y_size, z_size);
+@@ -631,15 +667,93 @@ void GridMap::clearAndInflateLocalMap()
+         }
+       }
+ 
+-  // add virtual ceiling to limit flight height
+-  if (mp_.virtual_ceil_height_ > -0.5)
++  // add virtual floor & ceiling to limit flight height
++  // (replaces the original "virtual ceiling only" block, same behavior when
++  //  the height_limit module is disabled and only virtual_ceil_height is set)
++  stampVirtualBoundaries();
++}
++
++void GridMap::computeEffectiveHeightLimits(double &floor_z, bool &floor_valid, double &ceil_z, bool &ceil_valid)
++{
++  floor_valid = false;
++  ceil_valid = false;
++
++  const double odom_z = md_.camera_pos_(2);
++
++  if (mp_.floor_active_)
+   {
+-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_);
+-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+-      {
+-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
+-      }
++    floor_z = mp_.virtual_floor_height_;
++    if (mp_.height_limit_enable_ && mp_.start_relax_)
++    {
++      /* start relaxation: while the drone is below the nominal floor (e.g.
++         taking off from the ground), push the sheet below itself so it can
++         climb into the corridor freely */
++      floor_z = std::min(floor_z, odom_z - mp_.start_relax_clearance_);
++    }
++    floor_valid = true;
++  }
++
++  if (mp_.ceil_active_)
++  {
++    ceil_z = mp_.virtual_ceil_z_;
++    if (mp_.height_limit_enable_ && mp_.start_relax_)
++    {
++      /* symmetric relaxation for the (rare) case of starting above the ceiling */
++      ceil_z = std::max(ceil_z, odom_z + mp_.start_relax_clearance_);
++    }
++    ceil_valid = true;
++  }
++}
++
++void GridMap::stampVirtualBoundaries()
++{
++  double floor_z, ceil_z;
++  bool floor_valid, ceil_valid;
++  computeEffectiveHeightLimits(floor_z, floor_valid, ceil_z, ceil_valid);
++
++  if (!floor_valid && !ceil_valid)
++    return;
++
++  /* fixed horizontal footprint: the whole local update window centered on the
++     current odom position. Deriving the footprint from the point-cloud local
++     bounds would collapse it to a single voxel column when every raw point is
++     filtered out (e.g. flying over a featureless filtered ground with no wall
++     in range), leaving holes in the corridor. The fixed footprint guarantees a
++     complete floor/ceiling sheet over the entire planning window at all times. */
++  Eigen::Vector3i fp_min, fp_max;
++  posToIndex(md_.camera_pos_ - mp_.local_update_range_, fp_min);
++  posToIndex(md_.camera_pos_ + mp_.local_update_range_, fp_max);
++  boundIndex(fp_min);
++  boundIndex(fp_max);
++
++  /* ---------- virtual floor: solid half space below the effective floor line ----------
++     Every voxel layer below floor_z is marked occupied, so the planner treats
++     the whole region under the floor exactly like solid ground. No tunneling
++     is possible and the effective minimum height equals ground_height_ + min_height. */
++  if (floor_valid)
++  {
++    int k_max = (int)ceil((floor_z - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
++    k_max = std::min(k_max, mp_.map_voxel_num_(2) - 1);
++
++    for (int z = 0; z <= k_max; ++z)
++      for (int x = fp_min(0); x <= fp_max(0); ++x)
++        for (int y = fp_min(1); y <= fp_max(1); ++y)
++          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
++  }
++
++  /* ---------- virtual ceiling: solid half space above the effective ceiling line ----------
++     Symmetric with the floor: no tunneling through the map top, and the
++     rebound logic of the optimizer sees a thick solid obstacle instead of a
++     fragile single-layer sheet. */
++  if (ceil_valid)
++  {
++    int k_min = (int)floor((ceil_z - mp_.map_origin_(2)) * mp_.resolution_inv_);
++    k_min = std::max(k_min, 0);
++
++    for (int z = k_min; z < mp_.map_voxel_num_(2); ++z)
++      for (int x = fp_min(0); x <= fp_max(0); ++x)
++        for (int y = fp_min(1); y <= fp_max(1); ++y)
++          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+   }
+ }
+ 
+@@ -771,6 +885,14 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
+     pt = latest_cloud.points[i];
+     p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
+ 
++    /* [height_limit] filter out real ground/ceiling points in advance.
++       They are either outside the corridor (unreachable for the drone) or
++       handled by the virtual boundary sheets, dropping them saves the
++       inflation work below. */
++    if (mp_.cloud_filter_enable_ &&
++        (p3d(2) < mp_.cloud_filter_z_min_ || p3d(2) > mp_.cloud_filter_z_max_))
++      continue;
++
+     /* point inside update range */
+     Eigen::Vector3d devi = p3d - md_.camera_pos_;
+     Eigen::Vector3i inf_pt;
+@@ -824,6 +946,11 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
+ 
+   boundIndex(md_.local_bound_min_);
+   boundIndex(md_.local_bound_max_);
++
++  /* [height_limit] stamp the virtual floor & ceiling sheets into the
++     inflated occupancy buffer. Must be done on every cloud because
++     resetBuffer() wipes the local box each time. */
++  stampVirtualBoundaries();
+ }
+ 
+ void GridMap::publishMap()
+diff --git a/src/planner/plan_manage/include/plan_manage/ego_replan_fsm.h b/src/planner/plan_manage/include/plan_manage/ego_replan_fsm.h
+index 60d8c25..a266e8e 100644
+--- a/src/planner/plan_manage/include/plan_manage/ego_replan_fsm.h
++++ b/src/planner/plan_manage/include/plan_manage/ego_replan_fsm.h
+@@ -57,6 +57,14 @@ namespace ego_planner
+     double planning_horizen_, planning_horizen_time_;
+     double emergency_time_;
+ 
++    /* virtual height corridor for target points (added) */
++    bool target_height_clamp_;      // clamp target z into the corridor automatically
++    bool use_target_z_;             // false: keep official behavior (ignore msg z, use default height)
++    bool corridor_valid_;           // corridor params valid and clamping active
++    double default_target_height_;  // official hardcoded 1.0, now a parameter
++    double target_z_margin_;        // shrink the corridor by this margin for targets
++    double corridor_min_z_, corridor_max_z_;
++
+     /* planning data */
+     bool trigger_, have_target_, have_odom_, have_new_target_;
+     FSM_EXEC_STATE exec_state_;
+@@ -90,6 +98,7 @@ namespace ego_planner
+ 
+     void planGlobalTrajbyGivenWps();
+     void getLocalTarget();
++    void clampTargetZ(double &z, const string &caller);
+ 
+     /* ROS functions */
+     void execFSMCallback(const ros::TimerEvent &e);
+diff --git a/src/planner/plan_manage/launch/advanced_param.xml b/src/planner/plan_manage/launch/advanced_param.xml
+index 380ae77..03402bd 100644
+--- a/src/planner/plan_manage/launch/advanced_param.xml
++++ b/src/planner/plan_manage/launch/advanced_param.xml
+@@ -52,6 +52,17 @@
+     <param name="fsm/planning_horizen_time" value="3" type="double"/>
+     <param name="fsm/emergency_time_" value="1.0" type="double"/>
+ 
++    <!-- ========== target height handling for the virtual corridor ========== -->
++    <!-- official code hardcoded the target height to 1.0; it is a parameter now -->
++    <param name="fsm/default_target_height" value="1.0" type="double"/>
++    <!-- false: ignore the z of the received goal (official behavior, for 2D Nav Goal)
++         true : use the z of the received goal (for 3D goal publishers) -->
++    <param name="fsm/use_target_z" value="false" type="bool"/>
++    <!-- automatically clamp the target z into [ground+min_height+margin, ground+max_height-margin] -->
++    <param name="fsm/target_height_clamp" value="true" type="bool"/>
++    <param name="fsm/target_z_margin" value="0.15" type="double"/>
++    <!-- ======== end of target height handling ======== -->
++
+     <param name="fsm/waypoint_num" value="$(arg point_num)" type="int"/>
+     <param name="fsm/waypoint0_x" value="$(arg point0_x)" type="double"/>
+     <param name="fsm/waypoint0_y" value="$(arg point0_y)" type="double"/>
+@@ -76,9 +87,8 @@
+     <param name="grid_map/local_update_range_x"  value="5.5" /> 
+     <param name="grid_map/local_update_range_y"  value="5.5" /> 
+     <param name="grid_map/local_update_range_z"  value="4.5" /> 
+-    <param name="grid_map/obstacles_inflation"     value="0.099" /> 
++    <param name="grid_map/obstacles_inflation"     value="0.099" />
+     <param name="grid_map/local_map_margin" value="30"/>
+-    <param name="grid_map/ground_height"        value="-0.01"/>
+     <!-- camera parameter -->
+     <param name="grid_map/cx" value="$(arg cx)"/>
+     <param name="grid_map/cy" value="$(arg cy)"/>
+@@ -101,7 +111,36 @@
+     <param name="grid_map/min_ray_length" value="0.1"/>
+     <param name="grid_map/max_ray_length" value="4.5"/>
+ 
+-    <param name="grid_map/virtual_ceil_height"   value="2.5"/>
++    <!-- ========== virtual height corridor (virtual floor & ceiling) ========== -->
++    <!-- legacy virtual ceiling of the official code, now disabled in favor of
++         height_limit/max_height below. If you enable both, the LOWER one wins. -->
++    <param name="grid_map/virtual_ceil_height"   value="-1.0"/>
++
++    <!-- enable the whole virtual height limit module -->
++    <param name="grid_map/height_limit/enable"   value="true"/>
++
++    <!-- height of the ground plane in the odom/world frame:
++         take off from the ground      : keep 0.0 (or the official -0.01)
++         take off from a stool h meter high: set to -h  (ground is BELOW the odom origin) -->
++    <param name="grid_map/ground_height"        value="0.0"/>
++
++    <!-- min flight height above the ground plane -->
++    <param name="grid_map/height_limit/min_height" value="0.30"/>
++    <!-- max flight height above the ground plane -->
++    <param name="grid_map/height_limit/max_height" value="2.20"/>
++
++    <!-- when the drone starts outside the corridor (e.g. taking off from the
++         ground, below min_height), the virtual floor is temporarily pushed
++         below the drone until it climbs into the corridor -->
++    <param name="grid_map/height_limit/start_relax"           value="true"/>
++    <param name="grid_map/height_limit/start_relax_clearance" value="0.20"/>
++
++    <!-- drop raw lidar points outside the corridor before building the map:
++         the real ground/ceiling points are replaced by the virtual planes,
++         this also saves CPU on edge boards like OrangePi/Jetson -->
++    <param name="grid_map/height_limit/cloud_filter"          value="true"/>
++    <!-- ============ end of virtual height corridor ============ -->
++
+     <param name="grid_map/visualization_truncate_height"   value="2.4"/>
+     <param name="grid_map/show_occ_time"  value="false"/>
+     <param name="grid_map/pose_type"     value="2"/>  
+diff --git a/src/planner/plan_manage/src/ego_replan_fsm.cpp b/src/planner/plan_manage/src/ego_replan_fsm.cpp
+index 029e9a4..5b32003 100644
+--- a/src/planner/plan_manage/src/ego_replan_fsm.cpp
++++ b/src/planner/plan_manage/src/ego_replan_fsm.cpp
+@@ -19,6 +19,26 @@ namespace ego_planner
+     nh.param("fsm/planning_horizen_time", planning_horizen_time_, -1.0);
+     nh.param("fsm/emergency_time_", emergency_time_, 1.0);
+ 
++    /* ---------- virtual height corridor for target points (added) ---------- */
++    nh.param("fsm/default_target_height", default_target_height_, 1.0);
++    nh.param("fsm/use_target_z", use_target_z_, false);
++    nh.param("fsm/target_height_clamp", target_height_clamp_, true);
++    nh.param("fsm/target_z_margin", target_z_margin_, 0.15);
++
++    bool hl_enable = false;
++    double hl_ground = 0.0, hl_min = -1.0, hl_max = -1.0;
++    nh.param("grid_map/height_limit/enable", hl_enable, false);
++    nh.param("grid_map/ground_height", hl_ground, 0.0);
++    nh.param("grid_map/height_limit/min_height", hl_min, -1.0);
++    nh.param("grid_map/height_limit/max_height", hl_max, -1.0);
++
++    corridor_valid_ = target_height_clamp_ && hl_enable && (hl_min > -0.5) && (hl_max > -0.5) &&
++                      (hl_min + target_z_margin_ < hl_max - target_z_margin_);
++    corridor_min_z_ = hl_ground + hl_min + target_z_margin_;
++    corridor_max_z_ = hl_ground + hl_max - target_z_margin_;
++    if (corridor_valid_)
++      ROS_INFO("[FSM] target z corridor: [%.2f, %.2f]", corridor_min_z_, corridor_max_z_);
++
+     nh.param("fsm/waypoint_num", waypoint_num_, -1);
+     for (int i = 0; i < waypoint_num_; i++)
+     {
+@@ -63,6 +83,9 @@ namespace ego_planner
+       wps[i](1) = waypoints_[i][1];
+       wps[i](2) = waypoints_[i][2];
+ 
++      /* [height_limit] clamp preset waypoints into the corridor */
++      clampTargetZ(wps[i](2), "preset");
++
+       end_pt_ = wps.back();
+     }
+     bool success = planner_manager_->planGlobalTrajWaypoints(odom_pos_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), wps, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+@@ -116,7 +139,17 @@ namespace ego_planner
+     init_pt_ = odom_pos_;
+ 
+     bool success = false;
+-    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, 1.0;
++
++    /* [height_limit] target height: use the z of the received goal when
++       fsm/use_target_z is on, otherwise keep the official behavior and use
++       fsm/default_target_height (official code hardcoded 1.0 here).
++       Then clamp into the virtual height corridor. */
++    double target_z = default_target_height_;
++    if (use_target_z_)
++      target_z = msg->poses[0].pose.position.z;
++    clampTargetZ(target_z, "waypoint");
++
++    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, target_z;
+     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+ 
+     visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, 0);
+@@ -152,6 +185,19 @@ namespace ego_planner
+     }
+   }
+ 
++  void EGOReplanFSM::clampTargetZ(double &z, const string &caller)
++  {
++    if (!corridor_valid_)
++      return;
++
++    double z_raw = z;
++    z = std::min(std::max(z, corridor_min_z_), corridor_max_z_);
++
++    if (fabs(z - z_raw) > 1e-3)
++      ROS_WARN_THROTTLE(1.0, "[%s] target z %.2f outside corridor [%.2f, %.2f], clamped to %.2f",
++                        caller.c_str(), z_raw, corridor_min_z_, corridor_max_z_, z);
++  }
++
+   void EGOReplanFSM::odometryCallback(const nav_msgs::OdometryConstPtr &msg)
+   {
+     odom_pos_(0) = msg->pose.pose.position.x;
