@@ -1,6 +1,11 @@
 # EGO-Planner 实机高度走廊说明
 
 本版本在原版 EGO-Planner 的基础上增加了“虚拟高度走廊”，并提供了 Fast-LIO 实机启动文件。
+使用:
+git clone https://github.com/ZJU-FAST-Lab/ego-planner.git
+cd ego-planner
+cp ~/path/ego-planner-height-limit.patch ./
+git apply ego-planner-height-limit.patch
 
 ## 新增功能
 
