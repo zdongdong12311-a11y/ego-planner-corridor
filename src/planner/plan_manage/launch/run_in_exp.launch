@@ -1,0 +1,106 @@
+<launch>
+  <!--
+    Real-vehicle EGO-Planner launch for Fast-LIO.
+    No simulator, map generator, or depth renderer is launched here.
+    /Odometry and /cloud_registered must use the same Fast-LIO world frame.
+  -->
+
+  <!-- Fast-LIO inputs. Override these at launch if your topic names differ. -->
+  <arg name="odom_topic" default="/Odometry"/>
+  <arg name="cloud_topic" default="/cloud_registered"/>
+  <!-- Normally camera_init for Fast-LIO. Set this to the actual frame_id in
+       /cloud_registered.header; RViz Fixed Frame must use the same frame. -->
+  <arg name="map_frame" default="camera_init"/>
+
+  <!-- Static map extent in Fast-LIO's world frame, centred at x=y=0. -->
+  <arg name="map_size_x" default="100.0"/>
+  <arg name="map_size_y" default="50.0"/>
+  <arg name="map_size_z" default="3.0"/>
+
+  <!-- Keep the planning horizon inside the 5.5 m local mapping range. -->
+  <arg name="planning_horizon" default="5.0"/>
+  <arg name="max_vel" default="1.0"/>
+  <arg name="max_acc" default="2.0"/>
+
+  <!--
+    Height corridor in the Fast-LIO world frame.  ground_height is the Z
+    coordinate of the real ground, not necessarily zero: if Fast-LIO starts
+    h metres above ground, it is commonly about -h.
+  -->
+  <arg name="ground_height" default="0.0"/>
+  <arg name="min_flight_height" default="0.30"/>
+  <arg name="max_flight_height" default="2.20"/>
+  <arg name="height_start_relax" default="true"/>
+  <arg name="height_start_relax_clearance" default="0.20"/>
+  <arg name="height_cloud_filter" default="true"/>
+
+  <!-- true: use RViz 2D Nav Goal; the planner fixes its Z to 1.0 m and then
+       clamps it to the corridor. -->
+  <arg name="flight_type" default="1"/>
+  <arg name="start_rviz" default="true"/>
+
+  <include file="$(find ego_planner)/launch/advanced_param.xml">
+    <arg name="map_size_x_" value="$(arg map_size_x)"/>
+    <arg name="map_size_y_" value="$(arg map_size_y)"/>
+    <arg name="map_size_z_" value="$(arg map_size_z)"/>
+    <arg name="odometry_topic" value="$(arg odom_topic)"/>
+    <arg name="cloud_topic" value="$(arg cloud_topic)"/>
+
+    <!-- Required by advanced_param.xml but unused in PointCloud2 mode. -->
+    <arg name="camera_pose_topic" value="/unused_camera_pose"/>
+    <arg name="depth_topic" value="/unused_depth"/>
+    <arg name="cx" value="0.0"/>
+    <arg name="cy" value="0.0"/>
+    <arg name="fx" value="0.0"/>
+    <arg name="fy" value="0.0"/>
+
+    <arg name="max_vel" value="$(arg max_vel)"/>
+    <arg name="max_acc" value="$(arg max_acc)"/>
+    <arg name="planning_horizon" value="$(arg planning_horizon)"/>
+    <arg name="flight_type" value="$(arg flight_type)"/>
+
+    <!-- Required only by preset-waypoint mode; harmless in 2D Nav mode. -->
+    <arg name="point_num" value="1"/>
+    <arg name="point0_x" value="0.0"/>
+    <arg name="point0_y" value="0.0"/>
+    <arg name="point0_z" value="1.0"/>
+    <arg name="point1_x" value="0.0"/>
+    <arg name="point1_y" value="0.0"/>
+    <arg name="point1_z" value="1.0"/>
+    <arg name="point2_x" value="0.0"/>
+    <arg name="point2_y" value="0.0"/>
+    <arg name="point2_z" value="1.0"/>
+    <arg name="point3_x" value="0.0"/>
+    <arg name="point3_y" value="0.0"/>
+    <arg name="point3_z" value="1.0"/>
+    <arg name="point4_x" value="0.0"/>
+    <arg name="point4_y" value="0.0"/>
+    <arg name="point4_z" value="1.0"/>
+
+    <arg name="map_frame" value="$(arg map_frame)"/>
+    <arg name="ground_height" value="$(arg ground_height)"/>
+    <arg name="min_flight_height" value="$(arg min_flight_height)"/>
+    <arg name="max_flight_height" value="$(arg max_flight_height)"/>
+    <arg name="height_start_relax" value="$(arg height_start_relax)"/>
+    <arg name="height_start_relax_clearance" value="$(arg height_start_relax_clearance)"/>
+    <arg name="height_cloud_filter" value="$(arg height_cloud_filter)"/>
+  </include>
+
+  <!-- Converts the planner's B-spline into quadrotor_msgs/PositionCommand on
+       /position_cmd. Connect that topic to the flight-control bridge only
+       after it has been checked in RViz. -->
+  <node pkg="ego_planner" name="traj_server" type="traj_server" output="screen">
+    <remap from="/odom_world" to="$(arg odom_topic)"/>
+    <param name="traj_server/time_forward" value="1.0" type="double"/>
+  </node>
+
+  <!-- RViz 2D Nav Goal -> /move_base_simple/goal -> Path for EGO FSM. -->
+  <node pkg="waypoint_generator" name="waypoint_generator" type="waypoint_generator" output="screen">
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <remap from="~goal" to="/move_base_simple/goal"/>
+    <remap from="~traj_start_trigger" to="/traj_start_trigger"/>
+    <param name="waypoint_type" value="manual-lonely-waypoint"/>
+  </node>
+
+  <include if="$(arg start_rviz)" file="$(find ego_planner)/launch/rviz.launch"/>
+</launch>
