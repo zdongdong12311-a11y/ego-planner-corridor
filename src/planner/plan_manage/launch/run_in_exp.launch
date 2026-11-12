@@ -77,13 +77,7 @@
     <arg name="point4_y" value="0.0"/>
     <arg name="point4_z" value="1.0"/>
 
-    <arg name="map_frame" value="$(arg map_frame)"/>
-    <arg name="ground_height" value="$(arg ground_height)"/>
-    <arg name="min_flight_height" value="$(arg min_flight_height)"/>
-    <arg name="max_flight_height" value="$(arg max_flight_height)"/>
-    <arg name="height_start_relax" value="$(arg height_start_relax)"/>
-    <arg name="height_start_relax_clearance" value="$(arg height_start_relax_clearance)"/>
-    <arg name="height_cloud_filter" value="$(arg height_cloud_filter)"/>
+    
   </include>
 
   <!-- Converts the planner's B-spline into quadrotor_msgs/PositionCommand on
